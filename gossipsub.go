@@ -920,13 +920,18 @@ func (gs *GossipSubRouter) Publish(msg *Message) {
 	}
 
 	out := rpcWithMessages(msg.Message)
+	count := 0
+	meta := newMsgMeta(msg.Message, "outbound")
 	for pid := range tosend {
 		if pid == from || pid == peer.ID(msg.GetFrom()) {
 			continue
 		}
 
 		gs.sendRPC(pid, out)
+		count++
 	}
+	meta.times = count
+	gs.p.reportMsgStats(meta, "ok")
 }
 
 func (gs *GossipSubRouter) Join(topic string) {

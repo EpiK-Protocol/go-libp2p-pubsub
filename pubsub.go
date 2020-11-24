@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -144,6 +145,8 @@ type PubSub struct {
 	signStrict bool
 
 	ctx context.Context
+
+	rpcReporter RPCReporterFunc
 }
 
 // PubSubRouter is the message router component of PubSub.
@@ -267,6 +270,15 @@ func NewPubSub(ctx context.Context, h host.Host, rt PubSubRouter, opts ...Option
 	go ps.processLoop(ctx)
 
 	return ps, nil
+}
+
+type RPCReporterFunc func(typ string, size, times int, status string, direction string)
+
+func WithRPCReporter(fn RPCReporterFunc) Option {
+	return func(p *PubSub) error {
+		p.rpcReporter = fn
+		return nil
+	}
 }
 
 // MsgIdFunction returns a unique ID for the passed Message, and PubSub can be customized to use any
@@ -543,7 +555,7 @@ func (p *PubSub) processLoop(ctx context.Context) {
 
 		case msg := <-p.publish:
 			p.tracer.PublishMessage(msg)
-			p.pushMsg(msg)
+			p.pushMsg(msg, nil)
 
 		case msg := <-p.sendMsg:
 			p.publishMessage(msg)
@@ -864,11 +876,57 @@ func (p *PubSub) notifyLeave(topic string, pid peer.ID) {
 	}
 }
 
+func sovRpc(x uint64) (n int) {
+	for {
+		n++
+		x >>= 7
+		if x == 0 {
+			break
+		}
+	}
+	return n
+}
+
+func (p *PubSub) reportMsgStats(meta *msgMeta, status string) {
+	if meta != nil && p.rpcReporter != nil && meta.size > 0 && meta.times > 0 {
+		p.rpcReporter(meta.typ, meta.size, meta.times, status, meta.direction)
+	}
+}
+
+type msgMeta struct {
+	typ       string
+	direction string
+	size      int
+	times     int
+}
+
+func newMsgMeta(msg *pb.Message, direction string) *msgMeta {
+	l := msg.Size()
+	size := 1 + l + sovRpc(uint64(l))
+	if len(msg.TopicIDs) == 0 {
+		return &msgMeta{
+			typ:       "noTopic",
+			direction: direction,
+			size:      size,
+			times:     1,
+		}
+	}
+
+	return &msgMeta{
+		typ:       msg.TopicIDs[0][:strings.LastIndex(msg.TopicIDs[0], "/")],
+		direction: direction,
+		size:      size,
+		times:     1,
+	}
+}
+
 func (p *PubSub) handleIncomingRPC(rpc *RPC) {
 	p.tracer.RecvRPC(rpc)
-
+	subSize := 0
 	for _, subopt := range rpc.GetSubscriptions() {
 		t := subopt.GetTopicid()
+		l := subopt.Size()
+		subSize += 1 + l + sovRpc(uint64(l))
 		if subopt.GetSubscribe() {
 			tmap, ok := p.topics[t]
 			if !ok {
@@ -895,24 +953,54 @@ func (p *PubSub) handleIncomingRPC(rpc *RPC) {
 			}
 		}
 	}
+	p.reportMsgStats(&msgMeta{
+		typ:       "subscription",
+		size:      subSize,
+		direction: "inbound",
+	}, "ok")
 
 	// ask the router to vet the peer before commiting any processing resources
-	if !p.rt.AcceptFrom(rpc.from) {
+	// if !p.rt.AcceptFrom(rpc.from) {
+	// 	log.Infof("received message from router graylisted peer %s. Dropping RPC", rpc.from)
+	// 	return
+	// }
+	accept := p.rt.AcceptFrom(rpc.from)
+	if !accept {
 		log.Infof("received message from router graylisted peer %s. Dropping RPC", rpc.from)
-		return
 	}
 
 	for _, pmsg := range rpc.GetPublish() {
+		meta := newMsgMeta(pmsg, "inbound")
+		if !accept {
+			p.reportMsgStats(meta, "graylist_peer")
+			continue
+		}
 		if !(p.subscribedToMsg(pmsg) || p.canRelayMsg(pmsg)) {
+			p.reportMsgStats(meta, "notsub")
 			log.Warn("received message we didn't subscribe to. Dropping.")
 			continue
 		}
 
 		msg := &Message{pmsg, rpc.from, nil}
-		p.pushMsg(msg)
+		p.pushMsg(msg, meta)
 	}
 
-	p.rt.HandleRPC(rpc)
+	l := rpc.Control.Size()
+	size := 1 + l + sovRpc(uint64(l))
+	if !accept {
+		p.reportMsgStats(&msgMeta{
+			typ:       "control",
+			size:      size,
+			direction: "inbound",
+		}, "graylist_peer")
+	} else {
+		p.reportMsgStats(&msgMeta{
+			typ:       "control",
+			size:      size,
+			direction: "inbound",
+		}, "ok")
+		p.rt.HandleRPC(rpc)
+	}
 }
 
 // DefaultMsgIdFn returns a unique ID of the passed Message
@@ -921,10 +1009,11 @@ func DefaultMsgIdFn(pmsg *pb.Message) string {
 }
 
 // pushMsg pushes a message performing validation as necessary
-func (p *PubSub) pushMsg(msg *Message) {
+func (p *PubSub) pushMsg(msg *Message, meta *msgMeta) {
 	src := msg.ReceivedFrom
 	// reject messages from blacklisted peers
 	if p.blacklist.Contains(src) {
+		p.reportMsgStats(meta, "blacklist_peer")
 		log.Warnf("dropping message from blacklisted peer %s", src)
 		p.tracer.RejectMessage(msg, rejectBlacklstedPeer)
 		return
@@ -932,6 +1021,7 @@ func (p *PubSub) pushMsg(msg *Message) {
 
 	// even if they are forwarded by good peers
 	if p.blacklist.Contains(msg.GetFrom()) {
+		p.reportMsgStats(meta, "from_blacklist")
 		log.Warnf("dropping message from blacklisted source %s", src)
 		p.tracer.RejectMessage(msg, rejectBlacklistedSource)
 		return
@@ -939,6 +1029,7 @@ func (p *PubSub) pushMsg(msg *Message) {
 
 	// reject unsigned messages when strict before we even process the id
 	if p.signStrict && msg.Signature == nil {
+		p.reportMsgStats(meta, "unsigned")
 		log.Debugf("dropping unsigned message from %s", src)
 		p.tracer.RejectMessage(msg, rejectMissingSignature)
 		return
@@ -947,6 +1038,7 @@ func (p *PubSub) pushMsg(msg *Message) {
 	// reject messages claiming to be from ourselves but not locally published
 	self := p.host.ID()
 	if peer.ID(msg.GetFrom()) == self && src != self {
+		p.reportMsgStats(meta, "from_self")
 		log.Debugf("dropping message claiming to be from self but forwarded from %s", src)
 		p.tracer.RejectMessage(msg, rejectSelfOrigin)
 		return
@@ -955,15 +1047,19 @@ func (p *PubSub) pushMsg(msg *Message) {
 	// have we already seen and validated this message?
 	id := p.msgID(msg.Message)
 	if p.seenMessage(id) {
+		p.reportMsgStats(meta, "duplicate")
 		p.tracer.DuplicateMessage(msg)
 		return
 	}
+	ms := p.markSeen(id)
 
 	if !p.val.Push(src, msg) {
+		p.reportMsgStats(meta, "wait_validation")
 		return
 	}
 
-	if p.markSeen(id) {
+	if ms {
+		p.reportMsgStats(meta, "ok")
 		p.publishMessage(msg)
 	}
 }

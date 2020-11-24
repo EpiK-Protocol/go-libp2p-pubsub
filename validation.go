@@ -251,13 +251,13 @@ func (v *validation) validate(vals []*topicVal, src peer.ID, msg *Message) {
 
 	// we can mark the message as seen now that we have verified the signature
 	// and avoid invoking user validators more than once
-	id := v.p.msgID(msg.Message)
-	if !v.p.markSeen(id) {
-		v.tracer.DuplicateMessage(msg)
-		return
-	} else {
-		v.tracer.ValidateMessage(msg)
-	}
+	// id := v.p.msgID(msg.Message)
+	// if !v.p.markSeen(id) {
+	// 	v.tracer.DuplicateMessage(msg)
+	// 	return
+	// } else {
+	v.tracer.ValidateMessage(msg)
+	// }
 
 	var inline, async []*topicVal
 	for _, val := range vals {
